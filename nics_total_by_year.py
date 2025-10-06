@@ -2,99 +2,185 @@
 import sys
 import re
 from pathlib import Path
+from typing import List, Optional
 
 import pdfplumber
 import pandas as pd
 
-YEAR_HEADER_RE = re.compile(r"\bYear\s+(\d{4})\b")
-# Lines we should ignore entirely
+# ---------------------------
+# Regex & constants
+# ---------------------------
+YEAR_HEADER_RE = re.compile(r"\bYear\s+(\d{4})\b", re.IGNORECASE)
+# Capture the full 4-digit year anywhere on the page as a fallback
+ANY_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+# Match header date ranges like: "January 1, 2025 - September 30, 2025"
+HEADER_RANGE_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+(?:19|20)\d{2}\s*-\s*"
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+(?:19|20)\d{2}",
+    re.IGNORECASE,
+)
+
+MONTHS_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+MONTHS_FULL = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+MONTH_TO_IDX = {name: i + 1 for i, name in enumerate(MONTHS_FULL)}
+
+# Lines to ignore
 IGNORE_PREFIXES = (
     "NICS Firearm Background Checks", "Month/Year by State", "State / Territory",
     "NOTE", "Page", "January 1", "These statistics", "They do not represent",
 )
-IGNORE_EXACT = set(["", "Totals"])  # blank or standalone labels to skip
+IGNORE_CONTAINS = ("State / Territory", "Totals by State", "Totals by Year")
+IGNORE_EXACT = {"", "Totals", "U.S. Total", "U. S. Total", "US Total", "U. S. Totals", "U.S. Totals"}
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def _numbers_in_line(line: str) -> List[int]:
+    """Return all integer tokens in a line, stripping commas."""
+    return [int(s.replace(",", "")) for s in re.findall(r"\d[\d,]*", line)]
 
 
 def is_state_row(line: str) -> bool:
     """
-    Heuristic: A state/territory total line typically starts with a letter,
-    contains numbers, and isn't a header or footnote line.
+    Heuristic for a state/territory summary line:
+      - Starts with a letter (state/territory name)
+      - Isn’t a header/footer/US total
+      - Contains numbers (months and totals)
     """
     s = line.strip()
-    if any(s.startswith(p) for p in IGNORE_PREFIXES): return False
-    if s in IGNORE_EXACT: return False
-    if not re.match(r"^[A-Za-z]", s): return False
-    # Require at least one number present (we'll take the last one on the line)
-    if not re.search(r"\d", s): return False
-    # Exclude obvious section labels
-    if "Grand Total" in s and "State / Territory" in s: return False
+    if s in IGNORE_EXACT:
+        return False
+    if any(s.startswith(p) for p in IGNORE_PREFIXES):
+        return False
+    if any(c in s for c in IGNORE_CONTAINS):
+        return False
+    if not re.match(r"^[A-Za-z]", s):
+        return False
+    if "U.S." in s or "U. S." in s or s.lower().startswith("us "):
+        return False
+    if not re.search(r"\d", s):
+        return False
     return True
 
 
-def parse_last_int(line: str) -> int | None:
+def _infer_year_for_page(text: str, current_year: Optional[int]) -> Optional[int]:
     """
-    Grab the last integer-looking token on the line (e.g., 1,234,567 -> 1234567).
+    Prefer explicit 'Year ####'. If missing, fall back to the most recent 4-digit year
+    present anywhere on the page (useful for partial/current-year pages).
     """
-    nums = re.findall(r"\d[\d,]*", line)
-    if not nums: return None
-    last = nums[-1].replace(",", "")
-    try:
-        return int(last)
-    except ValueError:
-        return None
+    page_years = YEAR_HEADER_RE.findall(text)
+    if page_years:
+        return int(page_years[-1])
+
+    any_years = [int(y) for y in ANY_YEAR_RE.findall(text) if int(y) >= 1998]
+    if any_years:
+        return max(any_years)
+
+    return current_year
 
 
-def extract_totals_by_year(pdf_path: Path) -> pd.DataFrame:
-    totals = {}  # year -> running sum of state grand totals
-    current_year = None
+def _infer_end_month_for_page(text: str, default: int = 12) -> int:
+    """
+    For partial years (e.g., 'January 1, 2025 - September 30, 2025'),
+    return the month index of the page's end month (Sep -> 9).
+    Falls back to the latest month name seen on the page, then to `default`.
+    """
+    m = HEADER_RANGE_RE.search(text)
+    if m:
+        end_month_name = m.group(2).capitalize()
+        return MONTH_TO_IDX.get(end_month_name, default)
+
+    # Fallback heuristic: pick the latest month name that appears
+    last_idx = default
+    for i, name in enumerate(MONTHS_FULL, start=1):
+        if name in text:
+            last_idx = i
+    return last_idx
+
+
+# ---------------------------
+# Core extractors
+# ---------------------------
+def extract_monthlies_by_year(pdf_path: Path) -> pd.DataFrame:
+    """
+    Build (year, month) -> national total. Handles partial years by reading the header
+    to learn the last month shown on the page (e.g., Jan–Sep).
+    """
+    monthly = {}  # year -> [12 monthly sums]
+    current_year: Optional[int] = None
+    current_end_month = 12
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            # Detect year header (there can be multiple per file)
-            # If multiple year mentions appear, take the last one on the page (most specific section header)
-            page_years = YEAR_HEADER_RE.findall(text)
-            if page_years:
-                current_year = int(page_years[-1])
+            current_year = _infer_year_for_page(text, current_year)
+            current_end_month = _infer_end_month_for_page(text, default=current_end_month)
 
-            # Walk lines and accumulate totals
             for raw_line in text.splitlines():
                 line = raw_line.strip()
-                if YEAR_HEADER_RE.search(line):
-                    # Reset to this year if a header is inline mid-page
-                    current_year = int(YEAR_HEADER_RE.search(line).group(1))
+
+                # Inline year reset if header appears mid-page
+                m = YEAR_HEADER_RE.search(line)
+                if m:
+                    current_year = int(m.group(1))
                     continue
 
-                if current_year is None:
-                    # Haven't found a year yet on earlier pages (unlikely), skip
+                if current_year is None or not is_state_row(line):
                     continue
 
-                if not is_state_row(line):
+                nums = _numbers_in_line(line)
+                # Expect the last value is the state Grand Total,
+                # and the preceding N values are months Jan..end_month.
+                need = current_end_month + 1  # months + grand total
+                if len(nums) < need:
+                    # Likely a wrapped/broken line; skip defensively
                     continue
 
-                # Skip lines that are clearly not state rows (common culprits)
-                # e.g., subtotal blurbs or section captions that look like sentences.
-                # Heuristic: if it has too many words with lowercase/periods and few numbers, skip.
-                words = re.findall(r"[A-Za-z]+", line)
-                if len(words) > 8 and len(re.findall(r"\d", line)) < 3:
+                months_vals = nums[-need:-1]  # exactly the visible months on this page
+                if len(months_vals) != current_end_month:
                     continue
 
-                val = parse_last_int(line)
-                if val is None:
-                    continue
+                if current_year not in monthly:
+                    monthly[current_year] = [0] * 12
 
-                # Defensive: exclude rows that look like month rows (they end with 12 numbers, not a single total)
-                # Our approach grabs the last number, which for state rows is the "Grand Total".
-                # If the line contains an unusual pattern like many numbers and no trailing total,
-                # it's safer to still take the last number (empirically correct for these PDFs).
-                print(f"{current_year}, {val}")
-                totals[current_year] = totals.get(current_year, 0) + val
+                for i in range(current_end_month):
+                    monthly[current_year][i] += months_vals[i]
 
-    # Build DataFrame
-    rows = [{"year": y, "total_background_checks": v} for y, v in sorted(totals.items())]
-    return pd.DataFrame(rows)
+    # Flatten to dataframe
+    rows = []
+    for y in sorted(monthly.keys()):
+        for i, val in enumerate(monthly[y], start=1):
+            rows.append({
+                "year": y,
+                "month": i,
+                "month_name": MONTHS_ABBR[i - 1],
+                "total_background_checks": val
+            })
+    return pd.DataFrame(rows).sort_values(["year", "month"]).reset_index(drop=True)
 
 
+def extract_totals_by_year(pdf_path: Path) -> pd.DataFrame:
+    """
+    Yearly totals are the sum of monthly totals (so partial years appear).
+    """
+    monthly_df = extract_monthlies_by_year(pdf_path)
+    if monthly_df.empty:
+        return pd.DataFrame(columns=["year", "total_background_checks", "basis"])
+
+    out = (
+        monthly_df.groupby("year", as_index=False)["total_background_checks"]
+        .sum()
+        .assign(basis="sum_of_months")
+        .sort_values("year")
+        .reset_index(drop=True)
+    )
+    return out
+
+
+# ---------------------------
+# CLI
+# ---------------------------
 def main():
     if len(sys.argv) < 2:
         print("Usage: python nics_totals_by_year.py /path/to/NICS_Firearm_Checks_-_Month_Year_by_State.pdf")
@@ -105,18 +191,33 @@ def main():
         print(f"File not found: {pdf_path}")
         sys.exit(1)
 
-    df = extract_totals_by_year(pdf_path)
-    if df.empty:
-        print("No year totals were found. Double-check the PDF format or adjust the heuristics.")
-        sys.exit(2)
+    # Extract
+    monthly_df = extract_monthlies_by_year(pdf_path)
+    yearly_df = extract_totals_by_year(pdf_path)
 
-    # Pretty print
-    print(df.sort_values("year").to_string(index=False))
+    # Print previews
+    if not yearly_df.empty:
+        print("=== NATIONAL TOTALS BY YEAR ===")
+        print(yearly_df.to_string(index=False))
+    else:
+        print("No year totals found.")
 
-    # Save CSV
-    out_csv = pdf_path.with_name("nics_totals_by_year.csv")
-    df.to_csv(out_csv, index=False)
-    print(f"\nWrote {out_csv}")
+    if not monthly_df.empty:
+        print("\n=== NATIONAL TOTALS BY YEAR-MONTH (first 12 rows) ===")
+        print(monthly_df.head(12).to_string(index=False))
+        print("...")
+        print(monthly_df.tail(12).to_string(index=False))
+    else:
+        print("\nNo monthly totals found.")
+
+    # Write CSVs
+    out_year = pdf_path.with_name("nics_totals_by_year.csv")
+    out_month = pdf_path.with_name("nics_totals_by_month.csv")
+    yearly_df.to_csv(out_year, index=False)
+    monthly_df.to_csv(out_month, index=False)
+    print(f"\nWrote {out_year}")
+    print(f"Wrote {out_month}")
+
 
 if __name__ == "__main__":
     main()
